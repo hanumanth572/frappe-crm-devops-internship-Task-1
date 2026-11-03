@@ -1,0 +1,162 @@
+observation 
+# Frappe CRM Local Docker Setup — Observation Report
+
+## 1. Objective
+
+Set up Frappe CRM locally on Windows using the Docker Compose configuration
+included in this project, identify any setup issue, apply a targeted fix, and
+verify that the CRM site is usable.
+
+## 2. Environment
+
+- Operating system: Windows
+- Docker Engine: 29.9.2
+- Docker Compose: v5.6.1
+- Project directory: `G:\pearl thoughts\frappe-crm-devops-internship-main`
+- Compose file: `docker\docker-compose.yml`
+- Initialization script: `docker\init.sh`
+
+The Compose stack contains three services:
+
+| Service | Purpose |
+|---|---|
+| `frappe` | Creates the Frappe bench, installs CRM, and runs the web and background processes |
+| `mariadb` | Stores the site and CRM data |
+| `redis` | Provides Frappe's cache, queue, and realtime services |
+
+The Compose file publishes port `8000` for the web application and `9000` for
+realtime services. MariaDB data is stored in the named Docker volume
+`mariadb-data`.
+
+## 3. Setup Procedure
+
+Open PowerShell in the project directory and start the services:
+
+```powershell
+docker compose -f "G:\pearl thoughts\frappe-crm-devops-internship-main\docker\docker-compose.yml" up -d
+```
+
+On first startup, the initialization script creates a Frappe v15 bench, gets
+the CRM app from its upstream `main` branch, creates the `crm.localhost` site,
+installs CRM, and starts the bench. This first run takes longer because Docker
+must download images and the bench must download and build application
+dependencies.
+
+Check the setup output and running services:
+
+```powershell
+docker compose -f "G:\pearl thoughts\frappe-crm-devops-internship-main\docker\docker-compose.yml" logs -f frappe
+docker compose -f "G:\pearl thoughts\frappe-crm-devops-internship-main\docker\docker-compose.yml" ps
+```
+
+Open `http://localhost:8000/login`, sign in as `Administrator` with the
+development password `admin`, and then open `http://localhost:8000/crm`.
+Although the site is named `crm.localhost`, `localhost` was used because
+`crm.localhost` did not resolve on this Windows environment.
+
+Useful commands for later:
+
+```powershell
+# Start the stack
+docker compose -f "G:\pearl thoughts\frappe-crm-devops-internship-main\docker\docker-compose.yml" up -d
+
+# Stop the stack without deleting the database volume
+docker compose -f "G:\pearl thoughts\frappe-crm-devops-internship-main\docker\docker-compose.yml" stop
+
+# Follow Frappe logs
+docker compose -f "G:\pearl thoughts\frappe-crm-devops-internship-main\docker\docker-compose.yml" logs -f frappe
+```
+
+## 4. Issue Observed
+
+The initial Docker startup downloaded the current `frappe/bench:latest` image.
+Its MariaDB command-line client was version 11.8.6 and enabled TLS by default.
+The Compose configuration runs MariaDB 10.8 without TLS configured. As a
+result, the client could not connect to the database during site creation.
+
+The relevant error was:
+
+```text
+TLS/SSL error: SSL is required, but the server does not support it
+```
+
+Because site creation failed, the database did not receive the Frappe tables
+needed for a working site. The initial script continued to later commands
+instead of stopping at the first failure. That led to follow-on errors such as
+missing `tabDefaultValue` and other tables. The CRM URL returned a “Not
+Permitted” response before the site was repaired.
+
+## 5. Code Change
+
+File changed: [`docker/init.sh`](./docker/init.sh)
+
+Two changes were made near the start of the script:
+
+```bash
+set -e
+
+printf '[client]\nskip-ssl\n' > "$HOME/.my.cnf"
+```
+
+### Why the TLS setting is needed
+
+The `[client]` setting tells MariaDB command-line clients in the Frappe
+container not to request TLS. This matches the local Compose setup, where the
+MariaDB service does not provide TLS. It allows commands used during bench
+site creation to connect successfully to MariaDB.
+
+This setting is for this local Docker development stack. It is not a
+recommendation to disable database encryption for a publicly exposed or
+production database.
+
+### Why `set -e` is needed
+
+`set -e` stops the initialization script when a command fails. Without it, a
+failed database connection during `bench new-site` can be followed by app
+installation, configuration, and server startup commands. Those later
+commands cannot produce a healthy site if its initial database setup failed.
+Failing immediately makes the original error visible and prevents a
+misleading partial startup.
+
+### What happens if these changes are omitted
+
+Without the TLS setting, the MariaDB client may reject the connection with
+the TLS/SSL error above. Site creation then fails, leaving the site database
+without its expected Frappe tables. Without fail-fast behavior, the script can
+continue and produce additional, confusing missing-table errors. The
+application may start at the container level, but the CRM site will not be
+usable.
+
+## 6. Recovery and Verification
+
+After applying the TLS setting in the running container, the site was created
+and CRM installed. The persistent script change ensures the setting is also
+written automatically when the stack initializes again.
+
+Verification performed:
+
+- All three Docker services (`frappe`, `mariadb`, and `redis`) were running.
+- `bench --site crm.localhost list-apps` reported:
+
+  ```text
+  frappe 15.125.0 version-15
+  crm    1.91.1   main
+  ```
+
+- An Administrator login request returned HTTP 200.
+- An authenticated request to `/crm` returned HTTP 200.
+- The Frappe container was restarted, and login plus `/crm` were checked again
+  successfully.
+- `docker/init.sh` passed `bash -n` syntax validation.
+
+## 7. Scope and Security Notes
+
+- This Compose setup gets CRM from the upstream `main` branch inside the
+  container. It does not install the current local checkout of the CRM Python
+  app or frontend source into the bench.
+- The default development credentials are `Administrator` / `admin`. Do not
+  expose this development instance to an untrusted network or reuse these
+  credentials in production.
+- The Docker Compose file emits a warning that its top-level `version` field
+  is obsolete. Compose v5 ignores that field; it did not prevent the stack
+  from running, so it was not changed as part of this fix.
